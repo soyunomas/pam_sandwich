@@ -1,101 +1,123 @@
-# pam_strict_totp
+# PAM Strict TOTP (High Security Module)
 
-**Módulo PAM de Alta Seguridad para Autenticación TOTP (Time-based One-Time Password).**
+[![Security: Hardened](https://img.shields.io/badge/Security-Hardened-green)](https://github.com/soyunomas/pam-totp-lab)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
-`pam_strict_totp` es un módulo diseñado bajo principios de *Secure Coding* (MISRA/CERT-C) para entornos críticos. A diferencia de otros módulos, prioriza la seguridad por defecto (**Fail-Close**), la gestión estricta de memoria y el aislamiento de privilegios.
+**Módulo PAM de Autenticación de Doble Factor (TOTP) diseñado bajo estándares MISRA-C y OpenBSD Secure Coding.**
 
-Implementa un flujo estándar de 2FA:
-1.  Autenticación de contraseña del sistema.
-2.  Solicitud separada del código de verificación (OTP).
+Este proyecto implementa una capa de seguridad 2FA para SSH y autenticaciones locales, priorizando la **paranoia** y la corrección técnica sobre la conveniencia. A diferencia de `libpam-google-authenticator`, este módulo es minimalista, auditable y fuerza prácticas seguras (Fail-Close, limpieza de memoria y separación de privilegios).
 
-## 🔒 Características de Seguridad
+---
 
-*   **Fail-Close por Defecto:** Si el archivo de secretos no existe, tiene permisos inseguros o no se puede leer, **el acceso se deniega**.
-*   **Privilege Separation:** El módulo reduce sus privilegios (drops root) a los del usuario objetivo antes de leer cualquier archivo.
-*   **Anti-Replay Estricto:** Ventana de tiempo configurada a `0` (requiere sincronización NTP precisa) para minimizar la ventana de ataque.
-*   **Rate Limiting:** Penalización de tiempo (3 segundos) ante cualquier fallo para mitigar ataques de fuerza bruta.
-*   **Memoria Segura:** Limpieza activa (`explicit_bzero`/`memset`) de claves y secretos en RAM tras su uso.
-*   **Input Hardening:** Validación estricta de entrada numérica (independiente del locale) y protección contra *Path Truncation*.
+## 🛡️ Características de Seguridad
 
-## Requisitos
+*   **Fail-Close por Defecto:** Si ocurre un error de sistema o permisos, el acceso se deniega inmediatamente.
+*   **Privilege Separation:** El proceso "suelta" los privilegios de `root` antes de leer el archivo del usuario.
+*   **Memory Hardening:** Uso de `explicit_bzero` (o equivalente) para borrar secretos de la RAM inmediatamente tras su uso.
+*   **Anti-Timing Attacks:** Implementación de flujo constante para evitar enumeración de usuarios.
+*   **Audit Trail:** Logs detallados en `syslog` (sin revelar información sensible).
+*   **Zero Warnings:** Compilado con `-Wall -Wextra -Werror -fstack-protector-all`.
 
-*   Linux (Probado en Debian/Ubuntu y RHEL).
-*   Reloj del sistema sincronizado (NTP).
-*   Librerías de desarrollo:
-    *   `libpam0g-dev`
-    *   `liboath-dev`
+---
 
-```bash
-sudo apt update
-sudo apt install -y build-essential libpam0g-dev liboath-dev
-```
+## 🚀 Instalación Rápida
 
-## Instalación
-
-1.  **Clonar el repositorio:**
+### 1. Requisitos Previos
+Necesitas un entorno Linux con las librerías de desarrollo de PAM y OATH.
 
 ```bash
-git clone https://github.com/soyunomas/pam_sandwich.git pam_strict_totp
-cd pam_strict_totp
-```
-
-2.  **Instalar dependencias y compilar:**
-
-```bash
+# Debian / Ubuntu / Kali
 make deps
-make build
+# O manualmente: sudo apt install build-essential libpam0g-dev liboath-dev
 ```
 
-3.  **Instalar en el sistema:**
+### 2. Compilación e Instalación
+El proceso es automático. El módulo se instalará en el directorio de seguridad correcto (`/lib/security` o `/usr/lib64/security` según tu distro).
 
 ```bash
+make build
 sudo make install
 ```
-Esto copiará `pam_strict_totp.so` al directorio de seguridad del sistema (ej. `/lib/x86_64-linux-gnu/security`).
 
-## Configuración del Usuario
+> **IMPORTANTE:** Al finalizar la instalación, verás automáticamente el manual de despliegue ("Hints"). Léelo atentamente.
 
-Cada usuario debe tener un archivo de secretos válido.
+---
 
-1.  Generar el secreto (o usar una app como Google Authenticator para obtener uno):
-    ```bash
-    # Ejemplo: Crear un archivo con un secreto Base32 (mínimo 16 caracteres)
-    echo "TU_SECRETO_BASE32_AQUI" > ~/.google_authenticator
-    ```
+## 🔑 Generación de Secretos (Usuario)
 
-2.  **CRÍTICO:** Establecer permisos. El módulo **bloqueará el acceso** si el archivo es legible por otros.
-    ```bash
-    chmod 600 ~/.google_authenticator
-    ```
+A diferencia de otros módulos, **pam_strict_totp** no genera el fichero por ti (principio de mínima responsabilidad). Cada usuario debe generar su propio secreto Base32 válido.
 
-## Configuración del Sistema (PAM)
+### Opción A: Generación Segura por Línea de Comandos (Recomendado)
+Ejecuta esto para generar un secreto aleatorio criptográficamente seguro de 20 bytes (32 caracteres Base32):
 
-Edita el archivo de autenticación (ej. `/etc/pam.d/sshd`).
-**Orden recomendado:** Añadir el módulo *después* de la autenticación común.
-
-```pam
-# 1. Autenticación estándar (Password)
-@include common-auth
-
-# 2. Requerir TOTP Estricto
-auth required pam_strict_totp.so
+```bash
+# Genera el secreto y lo guarda con permisos seguros
+umask 077
+head -c 20 /dev/urandom | base32 | tr -d '=' > ~/.google_authenticator
 ```
 
-### Opciones disponibles
+Para ver tu código y configurarlo en tu móvil (Google Authenticator / Aegis / Authy):
+```bash
+cat ~/.google_authenticator
+# Copia la cadena (ej: "JBSWY3DPEHPK3PXP...") y añádela manualmente a tu app.
+```
 
-*   `nullok`: Permite el acceso a usuarios que **no** tengan el archivo `.google_authenticator` creado. (Por defecto, si no existe, se bloquea el acceso).
-    ```pam
-    auth required pam_strict_totp.so nullok
-    ```
+### Opción B: Formato Manual
+Si prefieres crear el archivo a mano:
+1. El contenido debe ser **SOLO** el string Base32 (letras A-Z mayúsculas y números 2-7).
+2. **Sin espacios** intermedios.
+3. Mínimo 16 caracteres.
 
-## Guía Rápida de Operaciones
+**⚠️ CRÍTICO: Permisos del Archivo**
+El módulo **bloqueará el acceso** si el archivo `.google_authenticator` puede ser leído por alguien que no sea el usuario propietario.
 
-Para ver instrucciones detalladas y recordatorios de seguridad en tu terminal, ejecuta:
+```bash
+chmod 600 ~/.google_authenticator
+```
+
+---
+
+## ⚙️ Configuración del Sistema
+
+Una vez instalado, debes activar el módulo. Para ver las instrucciones exactas de qué archivos editar y dónde, ejecuta:
 
 ```bash
 make hints
 ```
 
-## Licencia
+### Resumen de configuración (Ejemplo para SSH)
 
-Este proyecto se distribuye bajo la licencia MIT. Consulta el archivo `LICENSE` para más detalles.
+1.  Editar `/etc/pam.d/sshd`:
+    ```pam
+    # Añadir al final o después de common-auth
+    auth required pam_strict_totp.so nullok
+    ```
+    *   `nullok`: Permite entrar a usuarios que aún no han configurado su archivo `.google_authenticator`. Si lo quitas, nadie sin archivo podrá entrar.
+
+2.  Editar `/etc/ssh/sshd_config`:
+    ```ssh
+    KbdInteractiveAuthentication yes
+    UsePAM yes
+    PasswordAuthentication no
+    ```
+
+3.  Reiniciar servicio: `sudo systemctl restart ssh`
+
+---
+
+## 🔍 Solución de Problemas
+
+Si no puedes entrar, verifica lo siguiente:
+
+1.  **Hora del Servidor:** TOTP depende del tiempo. Asegúrate de que el servidor tiene NTP activo y la hora es exacta.
+2.  **Permisos:** Revisa `/var/log/auth.log` o `journalctl`. Si ves "Insecure file permissions", ejecuta `chmod 600 ~/.google_authenticator`.
+3.  **Formato:** Asegúrate de que no hay espacios en blanco ni saltos de línea extraños en el archivo del secreto.
+4.  **Ventana de Tiempo:** El módulo permite una ventana de ±30 segundos (1 paso) para compensar retrasos humanos.
+
+---
+
+## 📜 Licencia
+
+Este proyecto se distribuye bajo la licencia **MIT**. Eres libre de usarlo, modificarlo y auditarlo.
+
+*Disclaimer: Este software toca sistemas críticos de autenticación. Úsalo bajo tu propia responsabilidad. Siempre mantén una sesión de root abierta mientras configuras PAM.*
