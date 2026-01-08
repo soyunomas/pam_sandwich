@@ -1,7 +1,29 @@
 /*
- * Compliance: MISRA-C / CERT C / PAM Standard
+ * ==============================================================================
+ *  PAM STRICT TOTP - High Security 2FA Module
+ * ==============================================================================
+ *
+ *  Author:      Soyunomas
+ *  Repository:  https://github.com/soyunomas/pam-totp-lab
+ *  License:     MIT
+ *
+ *  Description:
+ *  A hardened PAM module for Time-based One-Time Passwords (TOTP/RFC 6238).
+ *  Designed with a "Security First" mindset, following MISRA-C guidelines
+ *  and OpenBSD secure coding practices.
+ *
+ *  Key Features:
+ *   - Fail-Close Architecture (Deny by default on error).
+ *   - Strict Privilege Separation (Drops root before file access).
+ *   - Zero-Memory Residency (Secrets are wiped immediately).
+ *   - Anti-Timing Attack mitigations (Constant time execution path).
+ *
+ *  DISCLAIMER:
+ *  This software is provided "as is" without warranty of any kind.
+ *  Use in critical systems at your own risk.
+ *
+ * ==============================================================================
  */
-
 #define _GNU_SOURCE 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,33 +40,22 @@
 #include <limits.h>     
 #include <sys/prctl.h>  
 #include <stdint.h>
-
-/* Cabeceras de PAM */
 #include <security/pam_modules.h>
 #include <security/pam_ext.h>
-
-/* Cabecera para TOTP (liboath) */
 #include <liboath/oath.h>
 
-/* CONSTANTES DE SEGURIDAD */
 #define SECRET_FILE ".google_authenticator"
 #define MIN_SECRET_LEN 16
 #define MAX_SECRET_LEN 128
 
-/* FIX 3: Ventana estricta por defecto (0 pasos extra = solo hora actual) */
-#define TOTP_WINDOW    0  
-
-/* FIX 4: Delay en caso de fallo (3 segundos en microsegundos) */
+/* CONFIGURACIÓN TOTP */
+#define TOTP_STEP_SIZE 30  /* Estándar RFC 6238: 30 segundos */
+#define TOTP_WINDOW    1   /* Ventana de tolerancia: +/- 1 paso (30s) */
 #define FAIL_DELAY     3000000 
 
-/* Códigos de retorno internos para get_user_secret */
 #define SECRET_OK           0
 #define SECRET_NOT_FOUND    1
 #define SECRET_ERROR        -1
-
-/* =========================================================================
- * FUNCIONES AUXILIARES (MEMORIA Y LIMPIEZA)
- * ========================================================================= */
 
 static void secure_memzero(void *s, size_t n) {
     if (!s || n == 0) return;
@@ -65,17 +76,13 @@ static void secure_free(void **ptr, size_t size) {
     }
 }
 
-/* =========================================================================
- * GESTIÓN DE PRIVILEGIOS Y ARCHIVOS
- * ========================================================================= */
-
 static int get_user_secret(const char *username, char *secret_buf, size_t buf_size) {
     int retval = SECRET_ERROR;
     
     long bufsize_pwd = sysconf(_SC_GETPW_R_SIZE_MAX);
     if (bufsize_pwd == -1) bufsize_pwd = 16384;
 
-    char *buf_pwd = malloc((size_t)bufsize_pwd);
+    char *buf_pwd = calloc(1, (size_t)bufsize_pwd);
     if (!buf_pwd) return SECRET_ERROR;
 
     struct passwd pwd;
@@ -83,18 +90,17 @@ static int get_user_secret(const char *username, char *secret_buf, size_t buf_si
     memset(&pwd, 0, sizeof(pwd));
 
     if (getpwnam_r(username, &pwd, buf_pwd, (size_t)bufsize_pwd, &result) != 0 || result == NULL) {
-        secure_free((void**)&buf_pwd, 0);
+        secure_free((void**)&buf_pwd, (size_t)bufsize_pwd);
         return SECRET_ERROR;
     }
 
     char filepath[PATH_MAX];
     if (snprintf(filepath, sizeof(filepath), "%s/%s", pwd.pw_dir, SECRET_FILE) >= (int)sizeof(filepath)) {
         syslog(LOG_ERR, "PAM-TOTP: Path truncation for user %s", username);
-        secure_free((void**)&buf_pwd, 0);
+        secure_free((void**)&buf_pwd, (size_t)bufsize_pwd);
         return SECRET_ERROR;
     }
 
-    /* Guardar credenciales actuales */
     uid_t old_uid = geteuid();
     gid_t old_gid = getegid();
     
@@ -104,11 +110,11 @@ static int get_user_secret(const char *username, char *secret_buf, size_t buf_si
     if (original_ngroups > 0) {
         original_groups = malloc((size_t)original_ngroups * sizeof(gid_t));
         if (!original_groups) {
-            secure_free((void**)&buf_pwd, 0);
+            secure_free((void**)&buf_pwd, (size_t)bufsize_pwd);
             return SECRET_ERROR; 
         }
         if (getgroups(original_ngroups, original_groups) == -1) {
-            secure_free((void**)&buf_pwd, 0);
+            secure_free((void**)&buf_pwd, (size_t)bufsize_pwd);
             free(original_groups);
             return SECRET_ERROR;
         }
@@ -119,12 +125,11 @@ static int get_user_secret(const char *username, char *secret_buf, size_t buf_si
         setegid(pwd.pw_gid) != 0 ||
         seteuid(pwd.pw_uid) != 0) {
         
-        secure_free((void**)&buf_pwd, 0);
+        secure_free((void**)&buf_pwd, (size_t)bufsize_pwd);
         if (original_groups) free(original_groups);
         return SECRET_ERROR;
     }
 
-    /* Lectura segura */
     int fd = open(filepath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     FILE *fp = NULL;
 
@@ -145,38 +150,37 @@ static int get_user_secret(const char *username, char *secret_buf, size_t buf_si
             close(fd);
         }
     } else {
-        /* Distinguir entre error de sistema y fichero inexistente */
         if (errno == ENOENT) {
             retval = SECRET_NOT_FOUND;
         }
     }
 
-    /* FIX 1: RESTAURAR PRIVILEGIOS SIN ABORT() */
+    /* RESTAURAR PRIVILEGIOS */
     int restore_error = 0;
-    if (seteuid(old_uid) != 0 || setegid(old_gid) != 0) restore_error = 1;
-
-    if (original_ngroups > 0 && original_groups) {
-        if (setgroups(original_ngroups, original_groups) != 0) restore_error = 1;
-    } else {
-        if (setgroups(0, NULL) != 0) restore_error = 1;
+    if (seteuid(old_uid) != 0) restore_error = 1;
+    if (!restore_error) {
+        if (setegid(old_gid) != 0) restore_error = 1;
+        if (original_ngroups > 0 && original_groups) {
+            if (setgroups(original_ngroups, original_groups) != 0) restore_error = 1;
+        } else {
+            if (setgroups(0, NULL) != 0) restore_error = 1;
+        }
     }
 
     if (restore_error) {
-        syslog(LOG_CRIT, "%s", "PAM-TOTP: CRITICAL - Cannot restore privileges. Refusing to continue.");
+        syslog(LOG_CRIT, "PAM-TOTP: CRITICAL - Cannot restore privileges. Aborting.");
         if (fp) fclose(fp);
-        secure_free((void**)&buf_pwd, 0);
+        secure_free((void**)&buf_pwd, (size_t)bufsize_pwd);
         if (original_groups) free(original_groups);
-        return SECRET_ERROR; /* Retornar error al caller */
+        abort(); 
     }
 
-    secure_free((void**)&buf_pwd, 0);
+    secure_free((void**)&buf_pwd, (size_t)bufsize_pwd);
     if (original_groups) free(original_groups);
 
-    /* Leer secreto si todo fue bien */
     if (fp) {
         if (fgets(secret_buf, (int)buf_size, fp) != NULL) {
             size_t len = strnlen(secret_buf, buf_size);
-            /* Trim simple */
             while(len > 0 && (secret_buf[len-1] == '\n' || secret_buf[len-1] == '\r' || secret_buf[len-1] == ' ')) {
                 secret_buf[len-1] = '\0';
                 len--;
@@ -191,17 +195,12 @@ static int get_user_secret(const char *username, char *secret_buf, size_t buf_si
         }
         fclose(fp);
     } else if (retval != SECRET_NOT_FOUND) {
-        /* Si fp es NULL y no es porque no existe el fichero (ej: permisos), es ERROR */
         retval = SECRET_ERROR;
     }
 
     if (retval != SECRET_OK) secure_memzero(secret_buf, buf_size);
     return retval;
 }
-
-/* =========================================================================
- * MÓDULO PAM PRINCIPAL
- * ========================================================================= */
 
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
     (void)flags;
@@ -212,44 +211,35 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     char *secret_binary = NULL;
     size_t secret_binary_len = 0;
     int retval = PAM_AUTH_ERR;
-    
-    /* Configuración de argumentos */
     int nullok = 0;
+
     for (int i = 0; i < argc; i++) {
         if (argv[i] && strcmp(argv[i], "nullok") == 0) {
             nullok = 1;
         }
     }
 
-    /* 1. Obtener usuario */
     if (pam_get_user(pamh, &username, NULL) != PAM_SUCCESS || username == NULL) {
         return PAM_AUTH_ERR;
     }
 
-    /* 2. Cargar secreto con gestión estricta de errores */
     int secret_status = get_user_secret(username, secret_base32, sizeof(secret_base32));
 
-    if (secret_status == SECRET_NOT_FOUND) {
-        /* FIX 2: Fail-Close por defecto, salvo que 'nullok' esté activo */
-        if (nullok) {
-            return PAM_IGNORE;
-        } else {
-            /* Loguear solo si no es nullok para no spammear */
-            syslog(LOG_NOTICE, "PAM-TOTP: User %s missing secret file (denied by default)", username);
-            return PAM_AUTH_ERR;
+    int fake_mode = 0;
+    if (secret_status != SECRET_OK) {
+        if (secret_status == SECRET_NOT_FOUND && nullok) {
+            return PAM_IGNORE; 
         }
-    } else if (secret_status == SECRET_ERROR) {
-        return PAM_AUTH_ERR; /* Error de permisos o sistema -> Denegar */
+        fake_mode = 1;
+        strncpy(secret_base32, "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", sizeof(secret_base32)-1);
     }
 
-    /* 3. Solicitar OTP */
     retval = pam_prompt(pamh, PAM_PROMPT_ECHO_OFF, &otp_input, "Verification Code: ");
     
     if (retval != PAM_SUCCESS || otp_input == NULL) {
         goto cleanup;
     }
 
-    /* 4. Validación de Input (FIX 5: Locale independent) */
     size_t input_len = strlen(otp_input);
     if (input_len < 6 || input_len > 8) {
         retval = PAM_AUTH_ERR;
@@ -257,45 +247,44 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     }
 
     for (size_t i = 0; i < input_len; i++) {
-        /* Whitelist estricta ASCII */
         if (otp_input[i] < '0' || otp_input[i] > '9') {
             retval = PAM_AUTH_ERR;
             goto cleanup;
         }
     }
 
-    /* 5. Validar TOTP */
     int rc = oath_base32_decode(secret_base32, strlen(secret_base32), &secret_binary, &secret_binary_len);
     secure_memzero(secret_base32, sizeof(secret_base32));
 
     if (rc != OATH_OK) {
-        syslog(LOG_ERR, "PAM-TOTP: Base32 decode failed for user %s", username);
+        if (!fake_mode) syslog(LOG_ERR, "PAM-TOTP: Base32 decode failed for user %s", username);
         retval = PAM_AUTH_ERR;
         goto cleanup;
     }
 
     time_t now = time(NULL);
+    
+    /* FIX: Llamada correcta con paso de 30s y ventana de tolerancia */
     rc = oath_totp_validate3(secret_binary, secret_binary_len, 
-                             now, TOTP_WINDOW, 
-                             0, /* start offset */
-                             1, /* window size steps */
+                             now, 
+                             TOTP_STEP_SIZE,   /* PASO DE TIEMPO (30s) */
+                             0,                /* Inicio (0) */
+                             TOTP_WINDOW,      /* VENTANA (1 paso extra) */
                              NULL, NULL, 
                              otp_input);
 
-    if (rc == OATH_OK) {
+    if (rc == OATH_OK && !fake_mode) {
         retval = PAM_SUCCESS;
     } else {
         retval = PAM_AUTH_ERR;
-        syslog(LOG_NOTICE, "PAM-TOTP: Invalid OTP attempt for user %s", username);
+        if (!fake_mode) syslog(LOG_NOTICE, "PAM-TOTP: Invalid OTP attempt for user %s", username);
     }
 
 cleanup:
-    /* Limpieza */
     secure_memzero(secret_base32, sizeof(secret_base32));
     if (secret_binary) secure_free((void**)&secret_binary, secret_binary_len);
     if (otp_input) secure_free((void**)&otp_input, strlen(otp_input));
 
-    /* FIX 4: Rate Limiting en caso de error */
     if (retval != PAM_SUCCESS) {
         pam_fail_delay(pamh, FAIL_DELAY);
     }
