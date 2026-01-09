@@ -1,0 +1,357 @@
+/*
+ * ==============================================================================
+ *  PAM 2-MAN RULE TOTP - High Security Dual Control Module
+ * ==============================================================================
+ *
+ *  Author:      Soyunomas
+ *  Repository:  https://github.com/soyunomas/pam-totp-lab
+ *  License:     MIT
+ *  Standard:    MISRA-C / CERT C / OpenBSD Style
+ *  Description: Enforces Two-Person Integrity (TPI) via TOTP.
+ *               Requires Initiator + Privileged Authorizer (Wheel).
+ *
+ *  SECURITY FEATURES:
+ *  [x] Fail-Close Default
+ *  [x] Privilege Dropping (EUID/EGID)
+ *  [x] TOCTOU Mitigation (fstat)
+ *  [x] Memory Wiping (explicit_bzero fallback)
+ *  [x] Constant Time Logic (Anti-Enumeration)
+ *  [x] Input Whitelisting
+ *
+ * ==============================================================================
+ */
+
+#define _GNU_SOURCE
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <syslog.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <pwd.h>
+#include <grp.h>
+#include <fcntl.h>
+#include <time.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
+#include <security/pam_modules.h>
+#include <security/pam_ext.h>
+#include <liboath/oath.h>
+
+/* --- CONFIGURATION CONSTANTS --- */
+#define SECRET_FILENAME     ".google_authenticator"
+#define PRIVILEGED_GROUP    "wheel"
+#define TOTP_WINDOW         1
+#define TOTP_STEP           30
+#define FAIL_DELAY_MS       3000000
+
+/* Internal Status Codes */
+typedef enum {
+    STATUS_OK = 0,
+    STATUS_ERR_SYSTEM = -1,
+    STATUS_ERR_AUTH = -2,
+    STATUS_ERR_FILE = -3,
+    STATUS_NOT_FOUND = -4  /* Explicitly for missing file */
+} secure_status_t;
+
+/* --- SECURITY UTILS --- */
+
+static void secure_memzero(void *s, size_t n) {
+    if (!s || n == 0) return;
+#ifdef HAVE_EXPLICIT_BZERO
+    explicit_bzero(s, n);
+#else
+    volatile unsigned char *p = (volatile unsigned char *)s;
+    while (n--) *p++ = 0;
+    __asm__ __volatile__("" : : "r"(s) : "memory");
+#endif
+}
+
+static void secure_free(void **ptr, size_t size) {
+    if (ptr && *ptr) {
+        if (size > 0) secure_memzero(*ptr, size);
+        free(*ptr);
+        *ptr = NULL;
+    }
+}
+
+static int safe_strcpy(char *dest, size_t size, const char *src) {
+    if (!dest || !src || size == 0) return -1;
+    dest[0] = '\0';
+    if (snprintf(dest, size, "%s", src) >= (int)size) {
+        return -1;
+    }
+    return 0;
+}
+
+/* --- CORE LOGIC --- */
+
+static int is_user_privileged(const char *username, const char *groupname) {
+    struct group *grp;
+    char **members;
+    
+    if (!username || !groupname) return 0;
+
+    grp = getgrnam(groupname);
+    if (!grp) {
+        syslog(LOG_ERR, "PAM_2MAN: Critical - Group %s not found.", groupname);
+        return 0;
+    }
+
+    for (members = grp->gr_mem; *members != NULL; members++) {
+        if (strcmp(*members, username) == 0) return 1;
+    }
+    
+    struct passwd *pwd = getpwnam(username);
+    if (pwd && pwd->pw_gid == grp->gr_gid) return 1;
+
+    return 0;
+}
+
+/*
+ * Load Secret.
+ * Returns STATUS_NOT_FOUND if file is missing (useful for nullok).
+ * Returns STATUS_OK if loaded.
+ * Returns error otherwise.
+ */
+static secure_status_t load_user_secret(const char *username, char *secret_buf, size_t buf_size, int *fake_mode_out) {
+    secure_status_t status = STATUS_ERR_SYSTEM;
+    struct passwd pwd;
+    struct passwd *result = NULL;
+    char *buf_pwd = NULL;
+    char filepath[PATH_MAX];
+    FILE *fp = NULL;
+    int fd = -1;
+    
+    *fake_mode_out = 1;
+    memset(secret_buf, 0, buf_size);
+    /* Pre-fill with valid fake data for constant time ops */
+    safe_strcpy(secret_buf, buf_size, "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ");
+
+    long bufsize_sys = sysconf(_SC_GETPW_R_SIZE_MAX);
+    if (bufsize_sys == -1) bufsize_sys = 16384;
+
+    buf_pwd = calloc(1, (size_t)bufsize_sys);
+    if (!buf_pwd) return STATUS_ERR_SYSTEM;
+
+    if (getpwnam_r(username, &pwd, buf_pwd, (size_t)bufsize_sys, &result) != 0 || result == NULL) {
+        secure_free((void**)&buf_pwd, (size_t)bufsize_sys);
+        return STATUS_ERR_AUTH; 
+    }
+
+    if (snprintf(filepath, sizeof(filepath), "%s/%s", pwd.pw_dir, SECRET_FILENAME) >= (int)sizeof(filepath)) {
+        secure_free((void**)&buf_pwd, (size_t)bufsize_sys);
+        return STATUS_ERR_SYSTEM;
+    }
+
+    /* Save Privs */
+    uid_t root_uid = geteuid();
+    gid_t root_gid = getegid();
+    int ngroups = getgroups(0, NULL);
+    gid_t *groups = NULL;
+    if (ngroups > 0) {
+        groups = malloc((size_t)ngroups * sizeof(gid_t));
+        if (!groups) {
+             secure_free((void**)&buf_pwd, (size_t)bufsize_sys);
+             return STATUS_ERR_SYSTEM;
+        }
+        if (getgroups(ngroups, groups) == -1) {
+            free(groups);
+            secure_free((void**)&buf_pwd, (size_t)bufsize_sys);
+            return STATUS_ERR_SYSTEM;
+        }
+    }
+
+    /* DROP PRIVILEGES */
+    if (initgroups(username, pwd.pw_gid) != 0 || 
+        setegid(pwd.pw_gid) != 0 || 
+        seteuid(pwd.pw_uid) != 0) {
+        
+        secure_free((void**)&buf_pwd, (size_t)bufsize_sys);
+        if (groups) free(groups);
+        return STATUS_ERR_SYSTEM;
+    }
+
+    /* Open File */
+    fd = open(filepath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    
+    if (fd == -1) {
+        if (errno == ENOENT) status = STATUS_NOT_FOUND;
+        else status = STATUS_ERR_FILE;
+    } else {
+        struct stat st;
+        if (fstat(fd, &st) == 0) {
+            if (S_ISREG(st.st_mode) && st.st_uid == pwd.pw_uid && (st.st_mode & 0077) == 0) {
+                fp = fdopen(fd, "r");
+                if (fp) {
+                    if (fgets(secret_buf, (int)buf_size, fp) != NULL) {
+                        size_t len = strnlen(secret_buf, buf_size);
+                        while(len > 0 && (secret_buf[len-1] == '\n' || secret_buf[len-1] == '\r' || secret_buf[len-1] == ' ')) {
+                            secret_buf[len-1] = '\0';
+                            len--;
+                        }
+                        if (len >= 16) {
+                            *fake_mode_out = 0;
+                            status = STATUS_OK;
+                        } else {
+                            status = STATUS_ERR_FILE; /* Invalid content */
+                        }
+                    }
+                    fclose(fp);
+                } else {
+                    close(fd);
+                }
+            } else {
+                syslog(LOG_WARNING, "PAM_2MAN: Bad permissions on %s", filepath);
+                close(fd);
+                status = STATUS_ERR_FILE;
+            }
+        } else {
+            close(fd);
+        }
+    }
+
+    /* RESTORE PRIVILEGES */
+    int restore_fail = 0;
+    if (seteuid(root_uid) != 0) restore_fail = 1;
+    if (setegid(root_gid) != 0) restore_fail = 1;
+    if (groups && setgroups(ngroups, groups) != 0) restore_fail = 1;
+
+    if (restore_fail) abort();
+
+    if (groups) free(groups);
+    secure_free((void**)&buf_pwd, (size_t)bufsize_sys);
+
+    return status;
+}
+
+static int verify_totp(const char *username, const char *secret_base32, const char *input_code, int fake_mode) {
+    char *secret_bin = NULL;
+    size_t secret_bin_len = 0;
+    int rc;
+
+    size_t input_len = strlen(input_code);
+    if (input_len < 6 || input_len > 8) return PAM_AUTH_ERR;
+    for (size_t i = 0; i < input_len; i++) {
+        if (input_code[i] < '0' || input_code[i] > '9') return PAM_AUTH_ERR;
+    }
+
+    rc = oath_base32_decode(secret_base32, strlen(secret_base32), &secret_bin, &secret_bin_len);
+    if (rc != OATH_OK) {
+        if (!fake_mode) syslog(LOG_ERR, "PAM_2MAN: Bad Base32 for %s", username);
+        return PAM_AUTH_ERR;
+    }
+
+    time_t now = time(NULL);
+    rc = oath_totp_validate3(secret_bin, secret_bin_len, now, TOTP_STEP, 0, TOTP_WINDOW, NULL, NULL, input_code);
+    secure_free((void**)&secret_bin, secret_bin_len);
+
+    if (rc == OATH_OK && !fake_mode) return PAM_SUCCESS;
+    return PAM_AUTH_ERR;
+}
+
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    (void)flags;
+    
+    const char *user1 = NULL;
+    char *user2_input = NULL;
+    char *otp1 = NULL;
+    char *otp2 = NULL;
+    
+    char secret1[256];
+    char secret2[256];
+    int fake1 = 1, fake2 = 1;
+    int ret;
+    int final_result = PAM_AUTH_ERR;
+    int nullok = 0;
+    secure_status_t status1;
+
+    /* Parse Arguments */
+    for (int i = 0; i < argc; i++) {
+        if (argv[i] && strcmp(argv[i], "nullok") == 0) {
+            nullok = 1;
+        }
+    }
+
+    memset(secret1, 0, sizeof(secret1));
+    memset(secret2, 0, sizeof(secret2));
+
+    /* --- FASE 1: INICIADOR (User 1) --- */
+    if (pam_get_user(pamh, &user1, NULL) != PAM_SUCCESS || user1 == NULL) {
+        return PAM_AUTH_ERR;
+    }
+
+    status1 = load_user_secret(user1, secret1, sizeof(secret1), &fake1);
+    
+    /* Handle nullok: If user has no secret, bypass the whole module */
+    if (status1 == STATUS_NOT_FOUND && nullok) {
+        /* SECURITY: Bypass approved via configuration */
+        secure_memzero(secret1, sizeof(secret1));
+        return PAM_IGNORE; 
+    }
+
+    /* Ask User 1 OTP (Always run prompt to prevent enumeration if file is missing but nullok NOT set) */
+    char prompt_u1[128];
+    snprintf(prompt_u1, sizeof(prompt_u1), "Verification Code [%s]: ", user1);
+    ret = pam_prompt(pamh, PAM_PROMPT_ECHO_OFF, &otp1, "%s", prompt_u1);
+    
+    if (ret != PAM_SUCCESS || otp1 == NULL) goto cleanup;
+
+    if (verify_totp(user1, secret1, otp1, fake1) != PAM_SUCCESS) {
+        syslog(LOG_WARNING, "PAM_2MAN: User %s TOTP failed", user1);
+        final_result = PAM_AUTH_ERR;
+        goto cleanup;
+    }
+
+    /* --- FASE 2: AUTORIZADOR (User 2) --- */
+    ret = pam_prompt(pamh, PAM_PROMPT_ECHO_ON, &user2_input, "Authorizer Username (Wheel Group): ");
+    if (ret != PAM_SUCCESS || user2_input == NULL) goto cleanup;
+
+    if (strcmp(user1, user2_input) == 0) {
+        syslog(LOG_WARNING, "PAM_2MAN: Self-auth attempt by %s", user1);
+        final_result = PAM_AUTH_ERR;
+        goto cleanup;
+    }
+
+    if (!is_user_privileged(user2_input, PRIVILEGED_GROUP)) {
+        fake2 = 1; 
+    } else {
+        /* User 2 MUST have secret. nullok does not apply to Approver */
+        load_user_secret(user2_input, secret2, sizeof(secret2), &fake2);
+    }
+
+    char prompt_u2[128];
+    snprintf(prompt_u2, sizeof(prompt_u2), "Verification Code [%s]: ", user2_input);
+    ret = pam_prompt(pamh, PAM_PROMPT_ECHO_OFF, &otp2, "%s", prompt_u2);
+
+    if (ret != PAM_SUCCESS || otp2 == NULL) goto cleanup;
+
+    if (verify_totp(user2_input, secret2, otp2, fake2) == PAM_SUCCESS) {
+        syslog(LOG_NOTICE, "PAM_2MAN: Dual Auth Success (%s + %s)", user1, user2_input);
+        final_result = PAM_SUCCESS;
+    } else {
+        syslog(LOG_WARNING, "PAM_2MAN: Authorizer %s TOTP failed", user2_input);
+        final_result = PAM_AUTH_ERR;
+    }
+
+cleanup:
+    secure_memzero(secret1, sizeof(secret1));
+    secure_memzero(secret2, sizeof(secret2));
+    if (otp1) secure_free((void**)&otp1, strlen(otp1));
+    if (otp2) secure_free((void**)&otp2, strlen(otp2));
+    if (user2_input) secure_free((void**)&user2_input, strlen(user2_input));
+
+    if (final_result != PAM_SUCCESS) {
+        pam_fail_delay(pamh, FAIL_DELAY_MS);
+    }
+
+    return final_result;
+}
+
+PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    (void)pamh; (void)flags; (void)argc; (void)argv;
+    return PAM_SUCCESS;
+}
