@@ -6,7 +6,7 @@ El objetivo es demostrar diferentes estrategias de integración de códigos OTP 
 
 ## 📂 Estructura del Proyecto
 
-El repositorio se divide en cinco módulos independientes, cada uno con su propia lógica de seguridad y experiencia de usuario (UX):
+El repositorio se divide en seis módulos independientes, cada uno con su propia lógica de seguridad y experiencia de usuario (UX):
 
 ### 1. 🥪 `pam-sandwich` (Estrategia de Fusión TOTP)
 Un enfoque experimental donde el código TOTP estándar (Google Authenticator) se "esconde" dentro de la contraseña del usuario.
@@ -46,18 +46,26 @@ Módulo de autenticación contextual que valida el acceso basándose en la agend
 *   **Seguridad:** Fail-Close (bloqueo total si no hay agenda), variables dinámicas (`%H`, `%M`) para aumentar entropía y *Zero Warnings Policy*.
 *   **🔗 [Ir a la documentación de pam_school_schedule](./pam_school_schedule/README.md)**
 
+### 6. 👥 `pam_2man_totp` (Control Dual / Two-Man Rule)
+Implementación del principio de **integridad de dos personas** (TPI), similar a los protocolos de lanzamiento de misiles o apertura de bóvedas de alta seguridad.
+*   **Mecanismo:** El acceso requiere la autenticación criptográfica secuencial de dos usuarios distintos (Iniciador + Autorizador).
+*   **Formato:** Login User A -> TOTP A -> Prompt User B (Wheel) -> TOTP B.
+*   **Caso de uso:** Operaciones críticas (SSH Root, Sudo) donde ningún administrador debe poder actuar solo (prevención de Insider Threat).
+*   **Seguridad:** Anti-Auto-Aprobación, Drop Privileges, Memoria Segura y validación estricta de grupo `wheel`.
+*   **🔗 [Ir a la documentación de pam_2man_totp](./pam_2man_totp/README.md)**
+
 ---
 
 ## ⚡ Comparativa Rápida
 
-| Característica | pam-sandwich 🥪 | pam_strict_totp 🛡️ | pam_chronoguard ⏳ | pam_partial_key 🏦 | pam_school_schedule 🏫 |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Tecnología Base** | TOTP (OATH) | TOTP (OATH) | Tiempo (Pattern) | Partial Hash (SHA256) | Agenda / Reloj |
-| **Experiencia UX** | 1 Solo Prompt | 2 Prompts | 1 Solo Prompt | Interactivo (Desafío) | Prompt Contextual |
-| **Dependencia** | App Móvil | App Móvil | Reloj Mental | Clave Mental / Fichero | Configuración (File) |
-| **Complejidad Uso** | Media | Baja | Alta | Media (Visual) | Media (Cálculo) |
-| **Nivel Seguridad** | Medio (Obscurity) | Muy Alto (Hardened) | Alto (Anti-Forensic) | Alto (Anti-Keylogger) | Alto (Fail-Close) |
-| **Mitigación Principal** | Phishing Simple | Fuerza Bruta / Robo | Shoulder Surfing | **Keyloggers / Replay** | **Acceso Fuera Horario** |
+| Característica | pam-sandwich 🥪 | pam_strict_totp 🛡️ | pam_chronoguard ⏳ | pam_partial_key 🏦 | pam_school_schedule 🏫 | pam_2man_totp 👥 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Tecnología Base** | TOTP (OATH) | TOTP (OATH) | Tiempo (Pattern) | Partial Hash (SHA256) | Agenda / Reloj | TOTP (Dual/OATH) |
+| **Experiencia UX** | 1 Solo Prompt | 2 Prompts | 1 Solo Prompt | Interactivo (Desafío) | Prompt Contextual | 4 Pasos (Multi-User) |
+| **Dependencia** | App Móvil | App Móvil | Reloj Mental | Clave Mental / Fichero | Configuración (File) | 2 Personas + Apps |
+| **Complejidad Uso** | Media | Baja | Alta | Media (Visual) | Media (Cálculo) | Muy Alta (Coord.) |
+| **Nivel Seguridad** | Medio (Obscurity) | Muy Alto (Hardened) | Alto (Anti-Forensic) | Alto (Anti-Keylogger) | Alto (Fail-Close) | **Crítica (Military)** |
+| **Mitigación Principal** | Phishing Simple | Fuerza Bruta / Robo | Shoulder Surfing | **Keyloggers / Replay** | **Acceso Fuera Horario** | **Insider Threat** |
 
 ---
 
